@@ -1,0 +1,179 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kube-router-cfg
+  namespace: kube-system
+  labels:
+    tier: node
+    k8s-app: kube-router
+data:
+  cni-conf.json: |
+    {
+       "cniVersion":"0.3.0",
+       "name":"mynet",
+       "plugins":[
+          {
+             "name":"kubernetes",
+             "type":"bridge",
+             "bridge":"kube-bridge",
+             "isDefaultGateway":true,
+             "ipam":{
+                "type":"host-local"
+             }
+          }
+       ]
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kube-router
+  namespace: kube-system
+  labels:
+    k8s-app: kube-router
+spec:
+  selector:
+    matchLabels:
+      k8s-app: kube-router
+  template:
+    metadata:
+      labels:
+        k8s-app: kube-router
+    spec:
+      priorityClassName: system-node-critical
+      containers:
+      - name: kube-router
+        image: docker.io/cloudnativelabs/kube-router
+        args:
+          - "--run-router=true"
+          - "--run-firewall=true"
+          - "--run-service-proxy=true"
+          - "--bgp-graceful-restart=true"
+          - "--kubeconfig=/var/lib/kube-router/kubeconfig"
+          - "--advertise-external-ip=false"
+          - "--advertise-cluster-ip=false"
+          - "--advertise-loadbalancer-ip=true"
+          - "--advertise-pod-cidr=false"
+        securityContext:
+          privileged: true
+        imagePullPolicy: Always
+        env:
+        - name: NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: KUBE_ROUTER_CNI_CONF_FILE
+          value: /etc/cni/net.d/10-kuberouter.conflist
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 20244
+          initialDelaySeconds: 10
+          periodSeconds: 3
+        volumeMounts:
+        - name: lib-modules
+          mountPath: /lib/modules
+          readOnly: true
+        - name: cni-conf-dir
+          mountPath: /etc/cni/net.d
+        - name: kubeconfig
+          mountPath: /var/lib/kube-router
+          readOnly: true
+      initContainers:
+      - name: install-cni
+        image: docker.io/cloudnativelabs/kube-router
+        imagePullPolicy: Always
+        command:
+        - /bin/sh
+        - -c
+        - set -e -x;
+          if [ ! -f /etc/cni/net.d/10-kuberouter.conflist ]; then
+            if [ -f /etc/cni/net.d/*.conf ]; then
+              rm -f /etc/cni/net.d/*.conf;
+            fi;
+            TMP=/etc/cni/net.d/.tmp-kuberouter-cfg;
+            cp /etc/kube-router/cni-conf.json ${TMP};
+            mv ${TMP} /etc/cni/net.d/10-kuberouter.conflist;
+          fi
+        volumeMounts:
+        - name: cni-conf-dir
+          mountPath: /etc/cni/net.d
+        - name: kube-router-cfg
+          mountPath: /etc/kube-router
+      hostNetwork: true
+      tolerations:
+      - key: CriticalAddonsOnly
+        operator: Exists
+      - effect: NoSchedule
+        key: node-role.kubernetes.io/master
+        operator: Exists
+      - effect: NoSchedule
+        key: node.kubernetes.io/not-ready
+        operator: Exists
+      volumes:
+      - name: lib-modules
+        hostPath:
+          path: /lib/modules
+          type: ""
+      - name: cni-conf-dir
+        hostPath:
+          path: /etc/cni/net.d
+          type: ""
+      - name: kube-router-cfg
+        configMap:
+          name: kube-router-cfg
+          defaultMode: 420
+      - configMap:
+          defaultMode: 420
+          items:
+          - key: kubeconfig.conf
+            path: kubeconfig
+          name: kube-proxy
+        name: kubeconfig
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-router
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-router
+subjects:
+- kind: ServiceAccount
+  name: default
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-router
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  - pods
+  - services
+  - nodes
+  - endpoints
+  verbs:
+  - list
+  - get
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
+  verbs:
+  - list
+  - get
+  - watch
+- apiGroups:
+  - extensions
+  resources:
+  - networkpolicies
+  verbs:
+  - get
+  - list
+  - watch
